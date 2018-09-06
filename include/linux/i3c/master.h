@@ -261,6 +261,7 @@ struct i3c_bus {
 		struct list_head i2c;
 	} devs;
 	struct rw_semaphore lock;
+	int shared;
 };
 
 struct i3c_master_controller;
@@ -361,13 +362,21 @@ struct i3c_master_controller_ops {
 	int (*i2c_xfers)(struct i2c_device *dev,
 			 const struct i2c_msg *xfers, int nxfers);
 	u32 (*i2c_funcs)(struct i3c_master_controller *master);
-	int (*request_ibi)(struct i3c_device *dev,
+	int (*request_ibi)(struct i3c_master_controller *master, 
+			   struct i3c_device *dev,
 			   const struct i3c_ibi_setup *req);
 	void (*free_ibi)(struct i3c_device *dev);
-	int (*enable_ibi)(struct i3c_device *dev);
-	int (*disable_ibi)(struct i3c_device *dev);
+	int (*enable_ibi)(struct i3c_master_controller *master, 
+			  struct i3c_device *dev);
+	int (*disable_ibi)(struct i3c_master_controller *master,
+			   struct i3c_device *dev);
 	void (*recycle_ibi_slot)(struct i3c_device *dev,
 				 struct i3c_ibi_slot *slot);
+
+	void (*reattach_devs)(struct i3c_master_controller *master);
+
+	int (*hotjoin)(struct i3c_master_controller *master);
+	int (*request_mastership)(struct i3c_master_controller *master);
 };
 
 /**
@@ -402,6 +411,7 @@ struct i3c_master_controller {
 	bool init_done;
 	struct i3c_bus *bus;
 	struct workqueue_struct *wq;
+	struct work_struct mastership;
 };
 
 /**
@@ -456,7 +466,15 @@ int i3c_master_register(struct i3c_master_controller *master,
 			struct device *parent,
 			const struct i3c_master_controller_ops *ops,
 			bool secondary);
+
 int i3c_master_unregister(struct i3c_master_controller *master);
+
+int i3c_master_get_accmst_locked(struct i3c_master_controller *master,
+				 const struct i3c_device_info *info);
+
+int i3c_master_switch_operation_mode(struct i3c_master_controller *master,
+			      	struct i3c_device *i3cdev,
+			      	     bool secondary);
 
 /**
  * i3c_device_get_master_data() - get master private data attached to an I3C

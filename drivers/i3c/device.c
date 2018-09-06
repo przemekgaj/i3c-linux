@@ -42,6 +42,14 @@ int i3c_device_do_priv_xfers(struct i3c_device *dev,
 	if (!master || !xfers)
 		return -EINVAL;
 
+	if (master->bus->cur_master != master->this) {
+		if (!master->ops->request_mastership)
+			return -ENOTSUPP;
+
+		if (master->ops->request_mastership(master))
+			return -EIO;
+	}
+
 	if (!master->ops->priv_xfers)
 		return -ENOTSUPP;
 
@@ -95,7 +103,7 @@ int i3c_device_disable_ibi(struct i3c_device *dev)
 		goto out;
 	}
 
-	ret = master->ops->disable_ibi(dev);
+	ret = master->ops->disable_ibi(master, dev);
 	if (ret)
 		goto out;
 
@@ -138,7 +146,7 @@ int i3c_device_enable_ibi(struct i3c_device *dev)
 		goto out;
 	}
 
-	ret = master->ops->enable_ibi(dev);
+	ret = master->ops->enable_ibi(master, dev);
 	if (!ret)
 		dev->ibi->enabled = true;
 
@@ -193,7 +201,7 @@ int i3c_device_request_ibi(struct i3c_device *dev,
 	ibi->max_payload_len = req->max_payload_len;
 
 	dev->ibi = ibi;
-	ret = master->ops->request_ibi(dev, req);
+	ret = master->ops->request_ibi(master, dev, req);
 	if (ret) {
 		kfree(ibi);
 		dev->ibi = NULL;

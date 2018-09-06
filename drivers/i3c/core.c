@@ -420,6 +420,60 @@ static ssize_t mode_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(mode);
 
+static ssize_t mastership_show(struct device *dev,
+             struct device_attribute *da,
+             char *buf)
+{
+	struct i3c_bus *i3cbus = container_of(dev, struct i3c_bus, dev);
+	struct i3c_master_controller *master;
+	ssize_t ret;
+
+	if(!i3cbus->cur_master)
+		return sprintf(buf, "error. cur_master is NULL.\n");
+
+	master = i3c_device_get_master(i3cbus->cur_master);
+	if(!master)
+		return sprintf(buf, "error. cannot find master.\n");
+
+	if(master->secondary)
+		ret = sprintf(buf, "false\n");
+	else
+		ret = sprintf(buf, "true\n");
+
+	return ret;
+}
+
+static ssize_t mastership_store(struct device *dev,
+             struct device_attribute *attr,
+             const char *buf, size_t count)
+{
+	struct i3c_bus *i3cbus = container_of(dev, struct i3c_bus, dev);
+	struct i3c_master_controller *master;
+
+	if(!i3cbus->cur_master) {
+		dev_err(dev, "cur_master is NULL.");
+		return count;
+	}
+	master = i3c_device_get_master(i3cbus->cur_master);
+	if(!master) {
+		dev_err(dev, "could not find master.");
+		return count;
+	}
+
+	if(!master->ops->request_mastership) {
+		dev_err(dev, "mastership_request not supported.");
+		return count;
+	}
+
+	if(master->ops->request_mastership(master)) {
+		dev_err(dev, "mastership failed");
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(mastership);
+
 static ssize_t current_master_show(struct device *dev,
 				   struct device_attribute *da,
 				   char *buf)
@@ -427,9 +481,14 @@ static ssize_t current_master_show(struct device *dev,
 	struct i3c_bus *i3cbus = container_of(dev, struct i3c_bus, dev);
 	ssize_t ret;
 
-	i3c_bus_normaluse_lock(i3cbus);
-	ret = sprintf(buf, "%s\n", dev_name(&i3cbus->cur_master->dev));
-	i3c_bus_normaluse_unlock(i3cbus);
+	if (!i3cbus->cur_master) {
+		ret = sprintf(buf, "%s\n", "unknown");
+	}
+	else {
+		i3c_bus_normaluse_lock(i3cbus);
+		ret = sprintf(buf, "%s\n", dev_name(&i3cbus->cur_master->dev));
+		i3c_bus_normaluse_unlock(i3cbus);
+	}
 
 	return ret;
 }
@@ -467,6 +526,7 @@ static DEVICE_ATTR_RO(i2c_scl_frequency);
 
 static struct attribute *i3c_busdev_attrs[] = {
 	&dev_attr_mode.attr,
+	&dev_attr_mastership.attr,
 	&dev_attr_current_master.attr,
 	&dev_attr_i3c_scl_frequency.attr,
 	&dev_attr_i2c_scl_frequency.attr,
@@ -541,6 +601,7 @@ struct i3c_bus *i3c_bus_create(struct device *parent)
 		goto err_free_bus;
 
 	i3cbus->id = ret;
+	i3cbus->shared = 0;
 	device_initialize(&i3cbus->dev);
 
 	return i3cbus;
