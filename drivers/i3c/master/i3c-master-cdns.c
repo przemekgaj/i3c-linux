@@ -23,6 +23,8 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 
+#define DBG pr_info("%s:%i\n", __FUNCTION__, __LINE__);
+
 #define DEV_ID				0x0
 #define DEV_ID_I3C_MASTER		0x5034
 
@@ -388,6 +390,11 @@ struct cdns_i3c_xfer {
 
 struct cdns_i3c_master {
 	struct work_struct hj_work;
+	struct {
+		struct work_struct ms_handover_work;
+		u32 ibir;
+		spinlock_t lock;
+	} mastership;
 	struct i3c_master_controller base;
 	u32 free_rr_slots;
 	unsigned int maxdevs;
@@ -668,6 +675,54 @@ static void cdns_i3c_master_unqueue_xfer(struct cdns_i3c_master *master,
 	spin_unlock_irqrestore(&master->xferqueue.lock, flags);
 }
 
+static void cdns_i3c_master_dev_rr_to_info(struct cdns_i3c_master *master,
+					   unsigned int slot,
+					   struct i3c_device_info *info);
+
+static int cdns_i3c_sec_master_request_mastership(struct i3c_master_controller *m)
+{
+	struct cdns_i3c_master *master = to_cdns_i3c_master(m);
+
+	if(!m->secondary)
+		return -EINVAL;
+
+	writel(readl(master->regs + CTRL) | CTRL_MST_INIT | CTRL_MST_ACK,
+	       master->regs + CTRL);
+
+	writel(SLV_INT_MR_DONE, master->regs + SLV_IER);
+
+	return 0;
+}
+
+static void cdns_i3c_sec_master_reattach_devs(struct i3c_master_controller *m)
+{
+	struct cdns_i3c_master *master = to_cdns_i3c_master(m);
+	u8 addr;
+	u32 val, active_devs;
+	int ret;
+	int slot;
+	struct i3c_device_info info;
+
+	// FIXME: read value from DEVS_CTRL and initialize ony those devices
+	for (slot = 1; slot <= master->maxdevs; slot++) {
+		val = readl(master->regs + DEV_ID_RR0(slot));
+		if(val & DEV_ID_RR0_IS_I3C) {
+			cdns_i3c_master_dev_rr_to_info(master, slot, &info);
+			i3c_master_add_i3c_dev_locked(m, info.dyn_addr);
+		}
+	}
+}
+
+static int cdns_i3c_sec_master_hotjoin(struct i3c_master_controller *m)
+{
+	struct cdns_i3c_master *master = to_cdns_i3c_master(m);
+
+	writel(readl(master->regs + CTRL) | CTRL_HJ_INIT,
+	       master->regs + CTRL);
+
+	return 0;
+}
+
 static int cdns_i3c_master_send_ccc_cmd(struct i3c_master_controller *m,
 					struct i3c_ccc_cmd *cmd)
 {
@@ -816,7 +871,6 @@ static int cdns_i3c_master_i2c_xfers(struct i2c_device *dev,
 
 	for (i = 0; i < nxfers; i++) {
 		struct cdns_i3c_cmd *ccmd = &xfer->cmds[0];
-
 		ccmd->cmd0 = CMD0_FIFO_DEV_ADDR(xfers[i].addr) |
 			CMD0_FIFO_PL_LEN(xfers[i].len) |
 			CMD0_FIFO_PRIV_XMIT_MODE(XMIT_BURST_WITHOUT_SUBADDR);
@@ -937,6 +991,10 @@ static void cdns_i3c_master_reattach_i3c_dev(struct i3c_device *dev,
 	}
 	mutex_unlock(&dev->ibi_lock);
 }
+
+static int cdns_i3c_master_enable_ibi(struct i3c_device *dev);
+static int cdns_i3c_master_request_ibi(struct i3c_device *dev,
+				       const struct i3c_ibi_setup *req);
 
 static int cdns_i3c_master_attach_i3c_dev(struct i3c_device *dev)
 {
@@ -1173,10 +1231,6 @@ static int cdns_i3c_master_do_daa(struct i3c_master_controller *m)
 	if (old_i3c_scl_lim != master->i3c_scl_lim)
 		cdns_i3c_master_upd_i3c_scl_lim(master);
 
-	/* Unmask Hot-Join and Mastership request interrupts. */
-	i3c_master_enec_locked(m, I3C_BROADCAST_ADDR,
-			       I3C_CCC_EVENT_HJ | I3C_CCC_EVENT_MR);
-
 	return 0;
 }
 
@@ -1239,13 +1293,15 @@ static int cdns_i3c_master_bus_init(struct i3c_master_controller *m)
 	prescl1 = PRESCL_CTRL1_OD_LOW(ncycles);
 	writel(prescl1, master->regs + PRESCL_CTRL1);
 
-	/* Get an address for the master. */
-	ret = i3c_master_get_free_addr(m, 0);
-	if (ret < 0)
-		return ret;
+	if(!m->secondary) {
+		/* Get an address for the master. */
+		ret = i3c_master_get_free_addr(m, 0);
+		if (ret < 0)
+			return ret;
 
-	writel(prepare_rr0_dev_address(ret) | DEV_ID_RR0_IS_I3C,
-	       master->regs + DEV_ID_RR0(0));
+		writel(prepare_rr0_dev_address(ret) | DEV_ID_RR0_IS_I3C,
+		       master->regs + DEV_ID_RR0(0));
+	}
 
 	cdns_i3c_master_dev_rr_to_info(master, 0, &info);
 	if (info.bcr & I3C_BCR_HDR_CAP)
@@ -1344,9 +1400,39 @@ static void cnds_i3c_master_demux_ibis(struct cdns_i3c_master *master)
 
 		case IBIR_TYPE_MR:
 			WARN_ON(IBIR_XFER_BYTES(ibir) || (ibir & IBIR_ERROR));
+			master->mastership.ibir = ibir;
+			queue_work(master->base.wq, &master->mastership.ms_handover_work);
+			break;
 		default:
 			break;
 		}
+	}
+}
+
+static void cdns_i3c_master_release_bus(struct cdns_i3c_master *master)
+{
+	writel(MST_INT_MR_DONE, master->regs + MST_ICR);
+
+	i3c_master_switch_op_mode(&master->base, NULL, true);
+}
+
+static void cdns_i3c_sec_master_take_bus(struct cdns_i3c_master *master)
+{
+	writel(SLV_INT_MR_DONE, master->regs + SLV_ICR);
+
+	i3c_master_switch_op_mode(&master->base, NULL, false);
+}
+
+static void cdns_i3c_sec_master_event_demux(struct cdns_i3c_master *master)
+{
+	u32 status;
+
+	writel(SLV_INT_EVENT_UP, master->regs + SLV_ICR);
+
+	status = readl(master->regs + SLV_STATUS1);
+
+	if (!(status & SLV_STATUS1_MR_DIS)) {
+		i3c_master_mastership_enabled(&master->base);
 	}
 }
 
@@ -1355,16 +1441,31 @@ static irqreturn_t cdns_i3c_master_interrupt(int irq, void *data)
 	struct cdns_i3c_master *master = data;
 	u32 status;
 
-	status = readl(master->regs + MST_ISR);
-	if (!(status & readl(master->regs + MST_IMR)))
-		return IRQ_NONE;
+	if (master->base.secondary) {
+		status = readl(master->regs + SLV_ISR);
+		if (!(status & readl(master->regs + SLV_IMR)))
+			return IRQ_NONE;
+		if (status & SLV_INT_MR_DONE)
+			cdns_i3c_sec_master_take_bus(master);
+		
+		if (status & SLV_INT_EVENT_UP)
+			cdns_i3c_sec_master_event_demux(master);
+	}
+	else {
+		status = readl(master->regs + MST_ISR);
+		if (!(status & readl(master->regs + MST_IMR)))
+			return IRQ_NONE;
 
-	spin_lock(&master->xferqueue.lock);
-	cdns_i3c_master_end_xfer_locked(master, status);
-	spin_unlock(&master->xferqueue.lock);
+		spin_lock(&master->xferqueue.lock);
+		cdns_i3c_master_end_xfer_locked(master, status);
+		spin_unlock(&master->xferqueue.lock);
 
-	if (status & MST_INT_IBIR_THR)
-		cnds_i3c_master_demux_ibis(master);
+		if (status & MST_INT_MR_DONE)
+			cdns_i3c_master_release_bus(master);
+
+		if (status & MST_INT_IBIR_THR)
+			cnds_i3c_master_demux_ibis(master);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -1507,6 +1608,10 @@ static const struct i3c_master_controller_ops cdns_i3c_master_ops = {
 	.request_ibi = cdns_i3c_master_request_ibi,
 	.free_ibi = cdns_i3c_master_free_ibi,
 	.recycle_ibi_slot = cdns_i3c_master_recycle_ibi_slot,
+	.request_mastership = cdns_i3c_sec_master_request_mastership,
+	.reattach_devs = cdns_i3c_sec_master_reattach_devs,
+	.hotjoin = cdns_i3c_sec_master_hotjoin,
+
 };
 
 static void cdns_i3c_master_hj(struct work_struct *work)
@@ -1516,6 +1621,45 @@ static void cdns_i3c_master_hj(struct work_struct *work)
 						      hj_work);
 
 	i3c_master_do_daa(&master->base);
+
+	i3c_bus_normaluse_lock(master->base.bus);
+	/* Unmask Hot-Join and Mastership request interrupts. */
+	i3c_master_enec_locked(&master->base, I3C_BROADCAST_ADDR,
+			       I3C_CCC_EVENT_HJ | I3C_CCC_EVENT_MR);
+	i3c_bus_normaluse_unlock(master->base.bus);
+}
+
+static void cdns_i3c_master_ms_handover(struct work_struct *work)
+{
+	struct cdns_i3c_master *master = container_of(work,
+						      struct cdns_i3c_master,
+						      mastership.ms_handover_work);
+	struct i3c_device *dev;
+	u32 ibir = master->mastership.ibir;
+	u32 id = IBIR_SLVID(ibir);
+	int ret;
+
+	if (id >= master->ibi.num_slots || (ibir & IBIR_ERROR))
+		goto ms_error;
+
+	dev = master->ibi.slots[id];
+	if(!dev)
+		goto ms_error;
+
+	i3c_bus_maintenance_lock(master->base.bus);
+	ret = i3c_master_defslvs_locked(&master->base);
+	i3c_bus_maintenance_unlock(master->base.bus);
+	if (ret)
+		goto ms_error;
+
+	i3c_bus_maintenance_lock(master->base.bus);
+	ret = i3c_master_get_accmst_locked(&master->base, &dev->info);
+	i3c_bus_maintenance_unlock(master->base.bus);
+	if (ret)
+		goto ms_error;
+
+ms_error:
+	return;
 }
 
 static int cdns_i3c_master_probe(struct platform_device *pdev)
@@ -1523,6 +1667,7 @@ static int cdns_i3c_master_probe(struct platform_device *pdev)
 	struct cdns_i3c_master *master;
 	struct resource *res;
 	int ret, irq;
+	bool secondary;
 	u32 val;
 
 	master = devm_kzalloc(&pdev->dev, sizeof(*master), GFP_KERNEL);
@@ -1563,6 +1708,7 @@ static int cdns_i3c_master_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&master->xferqueue.list);
 
 	INIT_WORK(&master->hj_work, cdns_i3c_master_hj);
+	INIT_WORK(&master->mastership.ms_handover_work, cdns_i3c_master_ms_handover);
 	writel(0xffffffff, master->regs + MST_IDR);
 	writel(0xffffffff, master->regs + SLV_IDR);
 	ret = devm_request_irq(&pdev->dev, irq, cdns_i3c_master_interrupt, 0,
@@ -1571,6 +1717,12 @@ static int cdns_i3c_master_probe(struct platform_device *pdev)
 		goto err_disable_sysclk;
 
 	platform_set_drvdata(pdev, master);
+
+	val = readl(master->regs + MST_STATUS0);
+	if(val & MST_STATUS0_MASTER_MODE)
+		secondary = false;
+	else
+		secondary = true;
 
 	val = readl(master->regs + CONF_STATUS0);
 
@@ -1599,9 +1751,19 @@ static int cdns_i3c_master_probe(struct platform_device *pdev)
 	writel(DEVS_CTRL_DEV_CLR_ALL, master->regs + DEVS_CTRL);
 
 	ret = i3c_master_register(&master->base, &pdev->dev,
-				  &cdns_i3c_master_ops, false);
+				  &cdns_i3c_master_ops, secondary);
+	if(secondary)
+		writel(SLV_INT_MR_DONE | SLV_INT_EVENT_UP,
+			master->regs + SLV_IER);
+
 	if (ret)
 		goto err_disable_sysclk;
+
+	i3c_bus_normaluse_lock(master->base.bus);
+	/* Unmask Hot-Join and Mastership request interrupts. */
+	i3c_master_enec_locked(&master->base, I3C_BROADCAST_ADDR,
+			       I3C_CCC_EVENT_HJ | I3C_CCC_EVENT_MR);
+	i3c_bus_normaluse_unlock(master->base.bus);
 
 	return 0;
 

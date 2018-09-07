@@ -54,6 +54,11 @@ i3c_master_alloc_i2c_dev(struct i3c_master_controller *master,
 static int i3c_master_send_ccc_cmd_locked(struct i3c_master_controller *master,
 					  struct i3c_ccc_cmd *cmd)
 {
+	if (master->secondary) {
+		// FIXME: try to switch master mode in case of secondary master
+		return 0;
+	}
+
 	if (!cmd || !master)
 		return -EINVAL;
 
@@ -105,10 +110,8 @@ int i3c_master_get_free_addr(struct i3c_master_controller *master,
 }
 EXPORT_SYMBOL_GPL(i3c_master_get_free_addr);
 
-static void i3c_device_release(struct device *dev)
+static void i3c_master_set_free_addr(struct i3c_device *i3cdev)
 {
-	struct i3c_device *i3cdev = dev_to_i3cdev(dev);
-
 	if (i3cdev->info.static_addr)
 		i3c_bus_set_addr_slot_status(i3cdev->common.bus,
 					     i3cdev->info.static_addr,
@@ -118,8 +121,16 @@ static void i3c_device_release(struct device *dev)
 		i3c_bus_set_addr_slot_status(i3cdev->common.bus,
 					     i3cdev->info.dyn_addr,
 					     I3C_ADDR_SLOT_FREE);
+}
+
+static void i3c_device_release(struct device *dev)
+{
+	struct i3c_device *i3cdev = dev_to_i3cdev(dev);
+
+	i3c_master_set_free_addr(i3cdev);
 
 	of_node_put(dev->of_node);
+
 	kfree(i3cdev);
 }
 
@@ -185,11 +196,8 @@ int i3c_master_set_info(struct i3c_master_controller *master,
 {
 	struct i3c_device *i3cdev;
 
-	if (!i3c_bus_dev_addr_is_avail(master->bus, info->dyn_addr))
-		return -EINVAL;
-
-	if (I3C_BCR_DEVICE_ROLE(info->bcr) == I3C_BCR_I3C_MASTER &&
-	    master->secondary)
+	if (!master->secondary &&
+	    !i3c_bus_dev_addr_is_avail(master->bus, info->dyn_addr))
 		return -EINVAL;
 
 	if (master->this)
@@ -404,13 +412,13 @@ int i3c_master_defslvs_locked(struct i3c_master_controller *master)
 	defslvs->count = ndevs;
 	defslvs->master.bcr = master->this->info.bcr;
 	defslvs->master.dcr = master->this->info.dcr;
-	defslvs->master.dyn_addr = master->this->info.dyn_addr;
-	defslvs->master.static_addr = I3C_BROADCAST_ADDR;
+	defslvs->master.dyn_addr = (master->this->info.dyn_addr << 1);
+	defslvs->master.static_addr = (I3C_BROADCAST_ADDR << 1);
 
 	desc = defslvs->slaves;
 	i3c_bus_for_each_i2cdev(bus, i2cdev) {
 		desc->lvr = i2cdev->lvr;
-		desc->static_addr = i2cdev->info.addr;
+		desc->static_addr = (i2cdev->info.addr << 1);
 		desc++;
 	}
 
@@ -421,8 +429,8 @@ int i3c_master_defslvs_locked(struct i3c_master_controller *master)
 
 		desc->bcr = i3cdev->info.bcr;
 		desc->dcr = i3cdev->info.dcr;
-		desc->dyn_addr = i3cdev->info.dyn_addr;
-		desc->static_addr = i3cdev->info.static_addr;
+		desc->dyn_addr = (i3cdev->info.dyn_addr << 1);
+		desc->static_addr = (i3cdev->info.static_addr << 1);
 		desc++;
 	}
 
@@ -886,6 +894,34 @@ i3c_master_register_new_i3c_devs(struct i3c_master_controller *master)
 	}
 }
 
+int i3c_master_get_accmst_locked(struct i3c_master_controller *master,
+				 const struct i3c_device_info *info)
+{
+	u8 data;
+	struct i3c_ccc_cmd_dest dest = {
+		.addr = info->dyn_addr,
+		.payload.len = sizeof(data),
+		.payload.data = &data,
+	};
+	struct i3c_ccc_cmd cmd = {
+		.rnw = true,
+		.id = I3C_CCC_GETACCMST,
+		.dests = &dest,
+		.ndests = 1, };
+	int ret;
+
+	ret = i3c_master_send_ccc_cmd_locked(master, &cmd);
+
+	if (ret)
+		return ret;
+
+	if (dest.payload.len != sizeof(data))
+		return -EIO;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(i3c_master_get_accmst_locked);
+
 /**
  * i3c_master_do_daa() - do a DAA (Dynamic Address Assignment)
  * @master: master doing the DAA
@@ -1104,6 +1140,9 @@ int i3c_master_add_i3c_dev_locked(struct i3c_master_controller *master,
 
 		list_add_tail(&i3cdev->common.node, &master->bus->devs.i3c);
 	}
+	else {
+		i3cdev->info = info;
+	}
 
 	old_dyn_addr = i3cdev->info.dyn_addr;
 	i3cdev->info.dyn_addr = addr;
@@ -1207,8 +1246,7 @@ static int of_i3c_master_add_i3c_dev(struct i3c_master_controller *master,
 		if (reg[0] > I3C_MAX_ADDR)
 			return -EINVAL;
 
-		addrstatus = i3c_bus_get_addr_slot_status(master->bus,
-								  reg[0]);
+		addrstatus = i3c_bus_get_addr_slot_status(master->bus, reg[0]);
 		if (addrstatus != I3C_ADDR_SLOT_FREE)
 			return -EINVAL;
 	}
@@ -1379,6 +1417,8 @@ static void i3c_master_unregister_i3c_devs(struct i3c_master_controller *master)
 	i3c_bus_for_each_i3cdev(master->bus, i3cdev) {
 		if (device_is_registered(&i3cdev->dev))
 			device_del(&i3cdev->dev);
+
+		i3c_master_set_free_addr(i3cdev);
 	}
 }
 
@@ -1616,6 +1656,30 @@ static int i3c_master_check_ops(const struct i3c_master_controller_ops *ops)
 	return 0;
 }
 
+static void i3c_sec_master_mastership_takeover(struct work_struct *work)
+{
+	struct i3c_master_controller *master = container_of(work, struct i3c_master_controller, mastership);
+	struct i3c_device *i3cdev;
+
+	i3c_bus_maintenance_lock(master->bus);
+	master->ops->reattach_devs(master);
+	i3c_bus_maintenance_unlock(master->bus);
+
+	/*
+	 * We can register I3C devices obtained from master by DEFSLVS.
+	 */
+	master->init_done = true;
+	i3c_bus_normaluse_lock(master->bus);
+	i3c_master_register_new_i3c_devs(master);
+	i3c_bus_normaluse_unlock(master->bus);
+
+	return;
+
+err_cleanup_bus:
+	i3c_master_bus_cleanup(master);
+	return;
+}
+
 /**
  * i3c_master_register() - register an I3C master
  * @master: master used to send frames on the bus
@@ -1643,10 +1707,6 @@ int i3c_master_register(struct i3c_master_controller *master,
 			bool secondary)
 {
 	int ret;
-
-	/* We do not support secondary masters yet. */
-	if (secondary)
-		return -ENOTSUPP;
 
 	ret = i3c_master_check_ops(ops);
 	if (ret)
@@ -1701,6 +1761,47 @@ err_destroy_bus:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(i3c_master_register);
+
+int i3c_master_switch_op_mode(struct i3c_master_controller *master,
+			      const struct i3c_master_controller_ops *ops,
+			      bool secondary)
+{
+	if (master->secondary == secondary)
+		goto done;
+
+	master->secondary = secondary;
+
+	if (secondary) {
+		
+	} else {
+		INIT_WORK(&master->mastership, i3c_sec_master_mastership_takeover);
+		queue_work(master->wq, &master->mastership);
+	}
+
+done:
+	return 0;
+}
+EXPORT_SYMBOL_GPL(i3c_master_switch_op_mode);
+
+static void i3c_sec_master_bus_init(struct work_struct *work)
+{
+	struct i3c_master_controller *master = container_of(work, struct i3c_master_controller, mastership);
+
+	if (!master->ops->request_mastership)
+		return;
+
+	if (master->ops->request_mastership(master))
+		return;
+
+	
+}
+
+int i3c_master_mastership_enabled(struct i3c_master_controller *master)
+{
+	INIT_WORK(&master->mastership, i3c_sec_master_bus_init);
+	queue_work(master->wq, &master->mastership);
+}
+EXPORT_SYMBOL_GPL(i3c_master_mastership_enabled);
 
 /**
  * i3c_master_unregister() - unregister an I3C master

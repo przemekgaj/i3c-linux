@@ -420,6 +420,69 @@ static ssize_t mode_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(mode);
 
+static ssize_t mastership_show(struct device *dev,
+             struct device_attribute *da,
+             char *buf)
+{
+    struct i3c_bus *i3cbus = container_of(dev, struct i3c_bus, dev);
+    struct i3c_master_controller *master;
+    ssize_t ret;
+
+    if(!i3cbus->cur_master)
+        goto err_config;
+
+    master = i3c_device_get_master(i3cbus->cur_master);
+    if(!master)
+        goto err_config;
+
+    if(master->secondary)
+        ret = sprintf(buf, "false\n");
+    else
+        ret = sprintf(buf, "true\n");
+
+    return ret;
+err_config:
+    ret = sprintf(buf, "error\n");
+    return ret;
+}
+
+static ssize_t mastership_store(struct device *dev,
+             struct device_attribute *attr,
+             const char *buf, size_t count)
+{
+    struct i3c_bus *i3cbus = container_of(dev, struct i3c_bus, dev);
+    struct i3c_master_controller *master;
+    ssize_t ret;
+
+    if(!i3cbus->cur_master)
+        goto err_config;
+
+    master = i3c_device_get_master(i3cbus->cur_master);
+    if(!master)
+        goto err_config;
+
+    pr_info("Generating mastership request, sec: %d, pid: %llx\n", master->secondary, master->this->info.pid);
+
+    if(!master->ops->request_mastership)
+        goto err_notsupp;
+
+    if(master->ops->request_mastership(master))
+        goto err_mst_req_failed;
+
+    return count;
+
+err_config:
+    pr_err("Wrong configuration\n");
+err_notsupp:
+    pr_err("Not supported\n");
+err_mst_req_failed:
+    pr_err("Mastership failed\n");
+
+    return count;
+}
+
+static DEVICE_ATTR_RW(mastership);
+
 static ssize_t current_master_show(struct device *dev,
 				   struct device_attribute *da,
 				   char *buf)
@@ -467,6 +530,7 @@ static DEVICE_ATTR_RO(i2c_scl_frequency);
 
 static struct attribute *i3c_busdev_attrs[] = {
 	&dev_attr_mode.attr,
+    &dev_attr_mastership.attr,
 	&dev_attr_current_master.attr,
 	&dev_attr_i3c_scl_frequency.attr,
 	&dev_attr_i2c_scl_frequency.attr,

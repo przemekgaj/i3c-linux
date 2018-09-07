@@ -368,6 +368,11 @@ struct i3c_master_controller_ops {
 	int (*disable_ibi)(struct i3c_device *dev);
 	void (*recycle_ibi_slot)(struct i3c_device *dev,
 				 struct i3c_ibi_slot *slot);
+
+	void (*reattach_devs)(struct i3c_master_controller *master);
+
+	int (*hotjoin)(struct i3c_master_controller *master);
+	int (*request_mastership)(struct i3c_master_controller *master);
 };
 
 /**
@@ -402,6 +407,7 @@ struct i3c_master_controller {
 	bool init_done;
 	struct i3c_bus *bus;
 	struct workqueue_struct *wq;
+	struct work_struct mastership;
 };
 
 /**
@@ -456,7 +462,17 @@ int i3c_master_register(struct i3c_master_controller *master,
 			struct device *parent,
 			const struct i3c_master_controller_ops *ops,
 			bool secondary);
+
 int i3c_master_unregister(struct i3c_master_controller *master);
+
+int i3c_master_get_accmst_locked(struct i3c_master_controller *master,
+				 const struct i3c_device_info *info);
+
+int i3c_master_switch_op_mode(struct i3c_master_controller *master,
+			      const struct i3c_master_controller_ops *ops,
+			      bool secondary);
+
+int i3c_master_mastership_enabled(struct i3c_master_controller *master);
 
 /**
  * i3c_device_get_master_data() - get master private data attached to an I3C
